@@ -1,0 +1,38 @@
+name: CI Security Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project dependencies in a venv
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: SAST — Bandit (static code analysis)
+        run: |
+          . .venv/bin/activate
+          pip install bandit
+          bandit -r app.py -f txt
+
+      - name: SCA — pip-audit (dependency vulnerability scan)
+        run: |
+          . .venv/bin/activate
+          pip install pip-audit
+          pip-audit
